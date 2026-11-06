@@ -1,0 +1,5 @@
+# Python dependencies for bridge.py
+# Install with:  pip install -r requirements.txt
+
+python-chess>=1.10,<2
+maia3-runtime>=0.1
