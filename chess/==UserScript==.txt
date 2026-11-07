@@ -1,5 +1,5 @@
 // ==UserScript==
-// @name         Chess.com Bridge Bot (Minimal + Mouse Drag + Opening Boost + Draggable UI + Auto-Queue)
+// @name         Chess.com Bridge Bot
 // @namespace    chess-bridge
 // @version      1.5
 // @description  Routes chess moves through a local Maia/Stockfish bridge, simulates realistic mouse drags, plays faster in the opening, has a draggable panel, and auto-queues the next game.
