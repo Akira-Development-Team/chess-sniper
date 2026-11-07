@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         Chess.com Bridge Bot (Minimal + Mouse Drag + Opening Boost + Draggable UI)
+// @name         Chess.com Bridge Bot (Minimal + Mouse Drag + Opening Boost + Draggable UI + Auto-Queue)
 // @namespace    chess-bridge
-// @version      1.4
-// @description  Routes chess moves through a local Maia/Stockfish bridge, simulates realistic mouse drags, plays faster in the opening, and has a draggable/minimizable panel.
+// @version      1.5
+// @description  Routes chess moves through a local Maia/Stockfish bridge, simulates realistic mouse drags, plays faster in the opening, has a draggable panel, and auto-queues the next game.
 // @match        https://www.chess.com/play/*
 // @match        https://www.chess.com/game/*
 // @match        https://www.chess.com/daily
@@ -34,7 +34,8 @@
         openingBoost: GM_getValue('bot_openingBoost', true),
         openingMoves: GM_getValue('bot_openingMoves', 15),
         minimized:    GM_getValue('bot_minimized',    false),
-        panelPos:     GM_getValue('bot_panelPos',     null),   // {left, top}
+        panelPos:     GM_getValue('bot_panelPos',     null),
+        autoQueue:    GM_getValue('bot_autoQueue',    false),
     };
     const save = (k, v) => { settings[k] = v; GM_setValue(`bot_${k}`, v); };
 
@@ -49,6 +50,8 @@
         bridgeHealthy: null,
         lastEngine: null,
         lastOpponent: null,
+        queueObserver: null,
+        queueClicked: false,
     };
 
     // ── FEN helpers ────────────────────────────────────────────────────────
@@ -141,22 +144,22 @@
                     const d = JSON.parse(res.responseText);
                     state.bridgeHealthy = !!(d.maia_loaded && d.stockfish_loaded);
                     state.lastLiveResult = state.bridgeHealthy
-                        ? '✅ Bridge healthy — Maia + Stockfish loaded'
-                        : '⚠️ Bridge up but an engine failed to load';
+                        ? 'Bridge healthy — Maia + Stockfish loaded'
+                        : 'Bridge up but an engine failed to load';
                 } catch {
                     state.bridgeHealthy = false;
-                    state.lastLiveResult = '⚠️ Bridge responded but payload is invalid';
+                    state.lastLiveResult = 'Bridge responded but payload is invalid';
                 }
                 updateUI();
             },
             onerror: () => {
                 state.bridgeHealthy = false;
-                state.lastLiveResult = '⚠️ Bridge not reachable on 127.0.0.1:8765';
+                state.lastLiveResult = 'Bridge not reachable on 127.0.0.1:8765';
                 updateUI();
             },
             ontimeout: () => {
                 state.bridgeHealthy = false;
-                state.lastLiveResult = '⚠️ Bridge health check timed out';
+                state.lastLiveResult = 'Bridge health check timed out';
                 updateUI();
             },
         });
@@ -184,7 +187,7 @@
         const speedNote = mult < 0.95
             ? ` · m${moveNum} @ ${Math.round(mult * 100)}% delay`
             : '';
-        state.lastLiveResult = `🤔 Asking bridge${speedNote}…`;
+        state.lastLiveResult = `Asking bridge${speedNote}…`;
         updateUI();
 
         requestBridgeMove(fen, opponent, (data) => {
@@ -202,7 +205,7 @@
                 if (settings.autoMove) triggerAutoMove();
             } else {
                 state.bridgeHealthy = false;
-                state.lastLiveResult = '⚠️ Bridge returned no move — is bridge.py running?';
+                state.lastLiveResult = 'Bridge returned no move — is bridge.py running?';
             }
             updateUI();
         });
@@ -217,6 +220,104 @@
         const wait = Math.max(0, state.moveTargetTime - performance.now());
         setTimeout(() => playMove(state.currentBestMove), wait);
     }
+
+    // ═══ AUTO-QUEUE ════════════════════════════════════════════════════════
+    // Chess.com has no public API for starting a game, so we watch the DOM
+    // for the game-over modal and click its "New Game" / "Rematch" button.
+    // Two guards make this safe:
+    //   1. Only fires when a game-over container is actually present, so
+    //      browsing the Play menu won't trigger anything.
+    //   2. Only clicks buttons whose text is exactly "New Game" or "Rematch"
+    //      and which live inside a modal/game-over/dialog container.
+
+    function startAutoQueue() {
+        if (state.queueObserver) return;
+        state.queueObserver = new MutationObserver(handleQueueMutation);
+        state.queueObserver.observe(document.body, { childList: true, subtree: true });
+        handleQueueMutation(); // run once in case a modal is already up
+    }
+
+    function stopAutoQueue() {
+        if (state.queueObserver) {
+            state.queueObserver.disconnect();
+            state.queueObserver = null;
+        }
+        state.queueClicked = false;
+    }
+
+function handleQueueMutation() {
+    if (!settings.autoQueue) return;
+
+    const anyGameOver = document.querySelector(
+        '.game-over-modal-content, [class*="game-over"]'
+    );
+    if (!anyGameOver) {
+        state.queueClicked = false;
+        return;
+    }
+    if (state.queueClicked) return;
+
+    const buttons = document.querySelectorAll('button, [role="button"]');
+    let newGameBtn = null;
+
+    for (const b of buttons) {
+        const text = (b.textContent || '').trim().toLowerCase();
+
+        // Explicitly skip rematch — sending rematch requests is not
+        // what "auto-queue" means; it pins you to the same opponent.
+        if (text.includes('rematch')) continue;
+
+        // Accept "New Game", "New 5 min game", "Play new game", etc.
+        // Anything that mentions both "new" and "game" qualifies.
+        const isNewGame = text.includes('new') && text.includes('min');
+        if (!isNewGame) continue;
+
+        const visible =
+            b.offsetParent !== null &&
+            b.getBoundingClientRect().width > 0;
+        if (!visible) continue;
+
+        const inModal = b.closest(
+            '[class*="modal"], [class*="game-over"], [class*="game-result"], [class*="dialog"]'
+        );
+        if (!inModal) continue;
+
+        newGameBtn = b;
+        break;
+    }
+
+    if (!newGameBtn) {
+        // Nothing matched. Don't spam the status, but do log once so
+        // you can diagnose with the console if it ever stops working.
+        if (!state.queueLoggedNoButton) {
+            state.queueLoggedNoButton = true;
+            const visibleTexts = [...document.querySelectorAll('button, [role="button"]')]
+                .filter(b => b.offsetParent !== null)
+                .map(b => (b.textContent || '').trim())
+                .filter(Boolean);
+            console.log('[bridge] auto-queue: no New Game button found. Visible:', visibleTexts);
+        }
+        return;
+    }
+    state.queueLoggedNoButton = false;
+
+    state.queueClicked = true;
+    const clickedText = newGameBtn.textContent.trim();
+    const delayMs = 800 + Math.random() * 2200;
+    state.lastLiveResult = `🔄 Auto-queue "${clickedText}" in ${(delayMs / 1000).toFixed(1)}s…`;
+    updateUI();
+
+    setTimeout(() => {
+        try {
+            newGameBtn.click();
+            state.lastLiveResult = `🔄 Clicked "${clickedText}" — queuing next game`;
+        } catch (e) {
+            state.lastLiveResult = `⚠️ Auto-queue click failed: ${e.message}`;
+        }
+        updateUI();
+    }, delayMs);
+}
+    // ═══ END AUTO-QUEUE ════════════════════════════════════════════════════
 
     // ═══ BOARD GEOMETRY + MOUSE DRAG ═══════════════════════════════════════
 
@@ -374,13 +475,13 @@
             for (const m of state.board.game.getLegalMoves()) {
                 if (m.from === from && m.to === to) {
                     state.board.game.move({ ...m, promotion: promo, animate: true, userGenerated: true });
-                    state.lastLiveResult = `✅ Played ${from}→${to} (programmatic fallback)`;
+                    state.lastLiveResult = `Played ${from}→${to} (programmatic fallback)`;
                     updateUI();
                     return true;
                 }
             }
         } catch (e) {
-            state.lastLiveResult = `⚠️ Fallback error: ${e.message}`;
+            state.lastLiveResult = `Fallback error: ${e.message}`;
             updateUI();
         }
         return false;
@@ -425,11 +526,11 @@
                     const isPromotion = (from[1] === '7' && to[1] === '8') ||
                                         (from[1] === '2' && to[1] === '1');
                     if (isPromotion) await clickPromotionPiece(promo);
-                    state.lastLiveResult = `✅ Played ${from}→${to} (drag)`;
+                    state.lastLiveResult = `Played ${from}→${to} (drag)`;
                     updateUI();
                     return;
                 }
-                state.lastLiveResult = `⚠️ Drag didn't register — using fallback`;
+                state.lastLiveResult = `Drag didn't register — using fallback`;
                 updateUI();
             }
 
@@ -438,7 +539,7 @@
             }
         } catch (e) {
             console.error('[bridge] playMove error:', e);
-            state.lastLiveResult = `⚠️ Error: ${e.message}`;
+            state.lastLiveResult = `Error: ${e.message}`;
             state.lastSanitizedBoardFEN = '';
             updateUI();
         }
@@ -448,7 +549,7 @@
     function diagnoseBoard() {
         const info = locateBoard();
         if (!info) {
-            state.lastLiveResult = '🔍 Board not found — inspect DOM manually';
+            state.lastLiveResult = 'Board not found — inspect DOM manually';
             updateUI();
             return;
         }
@@ -458,13 +559,23 @@
         const e4 = squareToPixel(info, 'e4', flipped);
         const tag = info.el.tagName.toLowerCase();
         const shadow = info.host ? '(shadow)' : '';
+
+        // Also list visible button texts — useful for tuning auto-queue
+        const btnTexts = [...document.querySelectorAll('button, [role="button"]')]
+            .filter(b => b.offsetParent !== null)
+            .map(b => (b.textContent || '').trim())
+            .filter(Boolean)
+            .slice(0, 12);
+        const btnList = btnTexts.length ? ` btn=[${btnTexts.join(' | ')}]` : ' btn=[]';
+
         state.lastLiveResult =
-            `🔍 board=<${tag}>${shadow} ` +
+            `board=<${tag}>${shadow} ` +
             `rect=${Math.round(r.left)},${Math.round(r.top)} ` +
             `${Math.round(r.width)}x${Math.round(r.height)} ` +
             `flipped=${flipped} ` +
             `e2=${e2 ? `${Math.round(e2.x)},${Math.round(e2.y)}` : '—'} ` +
-            `e4=${e4 ? `${Math.round(e4.x)},${Math.round(e4.y)}` : '—'}`;
+            `e4=${e4 ? `${Math.round(e4.x)},${Math.round(e4.y)}` : '—'}` +
+            btnList;
         updateUI();
     }
 
@@ -501,10 +612,8 @@
         let drag = null;
 
         header.addEventListener('pointerdown', (e) => {
-            // Don't start a drag if the click landed on a header button
             if (e.target.closest('.hdr-btn')) return;
             e.preventDefault();
-
             const r = panel.getBoundingClientRect();
             drag = {
                 startX: e.clientX,
@@ -524,7 +633,6 @@
             panel.style.top   = nextTop  + 'px';
             panel.style.right = 'auto';
             panel.style.bottom = 'auto';
-            // Live-clamp so it can never be dragged fully off-screen
             clampPanelToViewport(panel);
         });
 
@@ -538,7 +646,6 @@
         header.addEventListener('pointerup', endDrag);
         header.addEventListener('pointercancel', endDrag);
 
-        // Keep panel visible if the window is resized smaller
         window.addEventListener('resize', () => {
             if (panel.isConnected) clampPanelToViewport(panel);
         });
@@ -617,8 +724,6 @@
                 border-top: 1px solid #333; margin: 8px 0 6px 0; padding-top: 6px;
                 font-size: 10px; color: #666; text-transform: uppercase; letter-spacing: 0.08em;
             }
-
-            /* ── Minimized state ── */
             #bridgePanel.minimized {
                 min-width: 0 !important;
                 padding: 4px 8px;
@@ -679,6 +784,11 @@
                 <label>Full speed at move</label>
                 <input type="number" id="bridgeOpeningMoves" value="${settings.openingMoves}" min="2" max="40">
             </div>
+            <div class="divider">Matchmaking</div>
+            <div class="row">
+                <label>Auto-queue next game</label>
+                <input type="checkbox" id="bridgeAutoQueue" ${settings.autoQueue ? 'checked' : ''}>
+            </div>
             <button id="bridgeAnalyze">Analyze Now</button>
             <button id="bridgeHealth" class="secondary">Check Bridge</button>
             <button id="bridgeDiag" class="secondary">Diagnose Board</button>
@@ -686,12 +796,9 @@
         document.body.appendChild(panel);
 
         const header = document.getElementById('bridgeHeader');
-
-        // Restore saved position + minimized state, then wire drag
         applySavedPanelState(panel, header);
         attachDragHandlers(panel, header);
 
-        // Buttons
         document.getElementById('bridgeClose').onclick = () => panel.remove();
         document.getElementById('bridgeMin').onclick = (e) => {
             e.stopPropagation();
@@ -704,12 +811,22 @@
         document.getElementById('bridgeMaxDelay').oninput = (e) => save('maxDelay', Math.max(0, parseFloat(e.target.value) || 0));
         document.getElementById('bridgeOpeningBoost').onchange = (e) => save('openingBoost', e.target.checked);
         document.getElementById('bridgeOpeningMoves').oninput = (e) => save('openingMoves', Math.max(2, parseInt(e.target.value, 10) || 15));
+
+        document.getElementById('bridgeAutoQueue').onchange = (e) => {
+            save('autoQueue', e.target.checked);
+            if (e.target.checked) startAutoQueue();
+            else stopAutoQueue();
+        };
+
         document.getElementById('bridgeAnalyze').onclick = () => {
             state.lastSanitizedBoardFEN = '';
             analyze();
         };
         document.getElementById('bridgeHealth').onclick = checkBridgeHealth;
         document.getElementById('bridgeDiag').onclick = diagnoseBoard;
+
+        // If auto-queue was already on at boot, resume the observer
+        if (settings.autoQueue) startAutoQueue();
     }
 
     function updateUI() {
@@ -720,11 +837,9 @@
                   : state.bridgeHealthy === false ? 'red'
                   :                                 'gray';
 
-        // Header dot (visible when minimized)
         const hdrDot = document.getElementById('bridgeHdrDot');
         if (hdrDot) hdrDot.className = `hdr-dot ${cls}`;
 
-        // Body status dot (visible when expanded)
         const engineTag = state.lastEngine
             ? (state.lastEngine === 'maia' ? '👤 Maia' : '🎯 Stockfish')
             : '—';
